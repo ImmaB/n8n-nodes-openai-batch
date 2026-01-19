@@ -643,14 +643,45 @@ export class OpenAiBatch implements INodeType {
 							},
 						);
 
-						const outputContent = typeof outputFileResponse === 'string'
-							? outputFileResponse
-							: typeof outputFileResponse.body === 'string'
-								? outputFileResponse.body
-								: JSON.stringify(outputFileResponse.body);
+						// Extract the content string from the response
+						let outputContent: string;
+						if (typeof outputFileResponse === 'string') {
+							outputContent = outputFileResponse;
+						} else if (outputFileResponse && typeof outputFileResponse.body === 'string') {
+							outputContent = outputFileResponse.body;
+						} else if (outputFileResponse && outputFileResponse.body && typeof outputFileResponse.body === 'object') {
+							// If body is a Buffer, convert to string
+							if (Buffer.isBuffer(outputFileResponse.body)) {
+								outputContent = outputFileResponse.body.toString('utf-8');
+							} else {
+								// Last resort: stringify (shouldn't happen for JSONL)
+								outputContent = JSON.stringify(outputFileResponse.body);
+							}
+						} else {
+							throw new NodeOperationError(
+								this.getNode(),
+								`Unexpected response format when downloading batch results. Response type: ${typeof outputFileResponse}`,
+							);
+						}
+
+						if (!outputContent || !outputContent.trim()) {
+							throw new NodeOperationError(
+								this.getNode(),
+								'Batch output file was empty',
+							);
+						}
 
 						const outputLines = outputContent.trim().split('\n');
-						const results: BatchResponse[] = outputLines.map((line: string) => JSON.parse(line));
+						const results: BatchResponse[] = outputLines.map((line: string, lineIndex: number) => {
+							try {
+								return JSON.parse(line);
+							} catch (e) {
+								throw new NodeOperationError(
+									this.getNode(),
+									`Failed to parse batch result line ${lineIndex + 1}: ${e instanceof Error ? e.message : 'Unknown error'}. Content: ${line.substring(0, 200)}`,
+								);
+							}
+						});
 
 						for (const result of results) {
 							resultMap.set(result.custom_id, result);
@@ -730,6 +761,26 @@ export class OpenAiBatch implements INodeType {
 						error: null,
 					});
 				} catch (error) {
+					// Build detailed error message for debugging
+					let errorMessage = error instanceof Error ? error.message : 'Unknown error during synchronous fallback';
+
+					// Capture additional error properties from n8n errors
+					const debugInfo: string[] = [];
+					if (error && typeof error === 'object') {
+						const err = error as Record<string, unknown>;
+						if (err.httpCode) debugInfo.push(`HTTP ${err.httpCode}`);
+						if (err.description) debugInfo.push(`Description: ${err.description}`);
+						if (err.cause) debugInfo.push(`Cause: ${err.cause}`);
+					}
+
+					// Include request info for debugging
+					debugInfo.push(`URL: https://api.openai.com${originalRequest.url}`);
+					debugInfo.push(`Body: ${JSON.stringify(originalRequest.body).substring(0, 500)}`);
+
+					if (debugInfo.length > 0) {
+						errorMessage += ' | Debug: ' + debugInfo.join(' | ');
+					}
+
 					resultMap.set(customId, {
 						id: `sync-${customId}`,
 						custom_id: customId,
@@ -740,7 +791,7 @@ export class OpenAiBatch implements INodeType {
 						},
 						error: {
 							code: 'sync_error',
-							message: error instanceof Error ? error.message : 'Unknown error during synchronous fallback',
+							message: errorMessage,
 						},
 					});
 				}
@@ -770,6 +821,24 @@ export class OpenAiBatch implements INodeType {
 						pairedItem: { item: i },
 					});
 				} else {
+					// Validate response structure
+					if (!result.response || !result.response.body) {
+						returnData.push({
+							json: {
+								...items[i].json,
+								error: {
+									message: 'Invalid response structure: missing response or body',
+									rawResult: result,
+								},
+								batchId: batchIds,
+								customId,
+								fallback: result.id?.startsWith('sync-') || false,
+							},
+							pairedItem: { item: i },
+						});
+						continue;
+					}
+
 					const responseBody = result.response.body;
 
 					if (operation === 'chatCompletion') {
@@ -777,29 +846,76 @@ export class OpenAiBatch implements INodeType {
 							message: { content: string; role: string };
 							index: number;
 							finish_reason: string;
-						}>;
+						}> | undefined;
 
-						returnData.push({
-							json: {
-								...items[i].json,
-								response: choices[0]?.message?.content || '',
-								fullResponse: responseBody,
-								batchId: batchIds,
-								customId,
-								fallback: result.id.startsWith('sync-'),
-							},
-							pairedItem: { item: i },
-						});
+						if (!choices || !Array.isArray(choices) || choices.length === 0) {
+							returnData.push({
+								json: {
+									...items[i].json,
+									error: {
+										message: 'No choices in response',
+										statusCode: result.response.status_code,
+									},
+									fullResponse: responseBody,
+									batchId: batchIds,
+									customId,
+									fallback: result.id.startsWith('sync-'),
+								},
+								pairedItem: { item: i },
+							});
+						} else {
+							returnData.push({
+								json: {
+									...items[i].json,
+									response: choices[0]?.message?.content || '',
+									fullResponse: responseBody,
+									batchId: batchIds,
+									customId,
+									fallback: result.id.startsWith('sync-'),
+								},
+								pairedItem: { item: i },
+							});
+						}
 					} else if (operation === 'embeddings') {
 						const data = responseBody.data as Array<{
 							embedding: number[];
 							index: number;
-						}>;
+						}> | undefined;
 
+						if (!data || !Array.isArray(data) || data.length === 0) {
+							returnData.push({
+								json: {
+									...items[i].json,
+									error: {
+										message: 'No embedding data in response',
+										statusCode: result.response.status_code,
+									},
+									fullResponse: responseBody,
+									batchId: batchIds,
+									customId,
+									fallback: result.id.startsWith('sync-'),
+								},
+								pairedItem: { item: i },
+							});
+						} else {
+							returnData.push({
+								json: {
+									...items[i].json,
+									embedding: data[0]?.embedding || [],
+									fullResponse: responseBody,
+									batchId: batchIds,
+									customId,
+									fallback: result.id.startsWith('sync-'),
+								},
+								pairedItem: { item: i },
+							});
+						}
+					} else {
+						// Fallback for unknown operation (shouldn't happen)
 						returnData.push({
 							json: {
 								...items[i].json,
-								embedding: data[0]?.embedding || [],
+								error: { message: `Unknown operation: ${operation}` },
 								fullResponse: responseBody,
 								batchId: batchIds,
 								customId,
@@ -813,7 +929,15 @@ export class OpenAiBatch implements INodeType {
 				returnData.push({
 					json: {
 						...items[i].json,
-						error: { message: 'No result found for this request' },
+						error: {
+							message: 'No result found for this request',
+							debug: {
+								expectedCustomId: customId,
+								resultMapSize: resultMap.size,
+								availableCustomIds: Array.from(resultMap.keys()),
+								batchStatuses: batches.map(b => ({ id: b.batchId, status: b.status })),
+							},
+						},
 						batchId: batchIds,
 						customId,
 						fallback: false,
