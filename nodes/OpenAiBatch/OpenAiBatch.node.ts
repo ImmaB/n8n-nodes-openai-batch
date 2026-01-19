@@ -484,18 +484,20 @@ export class OpenAiBatch implements INodeType {
 			{
 				method: 'GET',
 				url: `https://api.openai.com/v1/files/${batchStatus.output_file_id}/content`,
-				encoding: 'utf-8',
 				returnFullResponse: true,
+				json: false,
 			},
 		);
 
 		const outputContent = typeof outputFileResponse === 'string'
 			? outputFileResponse
-			: (outputFileResponse.body as string);
+			: typeof outputFileResponse.body === 'string'
+				? outputFileResponse.body
+				: JSON.stringify(outputFileResponse.body);
 
 		// Parse JSONL response
 		const outputLines = outputContent.trim().split('\n');
-		const results: BatchResponse[] = outputLines.map((line) => JSON.parse(line));
+		const results: BatchResponse[] = outputLines.map((line: string) => JSON.parse(line));
 
 		// Map results back to input items order
 		const resultMap = new Map<string, BatchResponse>();
