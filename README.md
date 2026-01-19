@@ -8,6 +8,8 @@ An n8n community node for executing batch requests to OpenAI's Batch API. This n
 - **Embeddings** - Batch generate embeddings for multiple texts
 - **Automatic polling** - Waits for batch completion and returns results
 - **Cost effective** - OpenAI Batch API offers 50% discount vs synchronous requests
+- **Auto-splitting** - Large request sets are automatically split into multiple batches (configurable max size)
+- **Fallback mode** - Option to cancel batches after a deadline and run remaining requests synchronously
 
 ## Installation
 
@@ -56,8 +58,10 @@ npm install n8n-nodes-openai-batch
 |--------|-------------|---------|
 | Max Tokens | Maximum tokens to generate (chat only) | 1000 |
 | Temperature | Controls randomness (0-2) | 1 |
+| Max Batch Size | Maximum requests per batch (larger inputs split automatically) | 100 |
 | Polling Interval | Seconds between status checks | 30 |
 | Timeout | Maximum wait time in minutes | 1440 (24h) |
+| Fallback Deadline | Minutes before canceling batches and running remaining requests synchronously (0 = disabled) | 0 |
 | Metadata | Custom JSON metadata for the batch | {} |
 
 ## Output

@@ -303,6 +303,13 @@ export class OpenAiBatch implements INodeType {
 						description: 'Controls randomness. Lower is more deterministic.',
 					},
 					{
+						displayName: 'Max Batch Size',
+						name: 'maxBatchSize',
+						type: 'number',
+						default: 100,
+						description: 'Maximum number of requests per batch. Larger inputs will be split into multiple batches.',
+					},
+					{
 						displayName: 'Polling Interval (Seconds)',
 						name: 'pollingInterval',
 						type: 'number',
@@ -315,6 +322,13 @@ export class OpenAiBatch implements INodeType {
 						type: 'number',
 						default: 1440,
 						description: 'Maximum time to wait for batch completion (default 24 hours)',
+					},
+					{
+						displayName: 'Fallback Deadline (Minutes)',
+						name: 'fallbackDeadline',
+						type: 'number',
+						default: 0,
+						description: 'If set, cancel incomplete batches after this time and run remaining requests synchronously. 0 = disabled.',
 					},
 					{
 						displayName: 'Metadata',
@@ -403,13 +417,19 @@ export class OpenAiBatch implements INodeType {
 		const options = this.getNodeParameter('options', 0, {}) as {
 			maxTokens?: number;
 			temperature?: number;
+			maxBatchSize?: number;
 			pollingInterval?: number;
 			timeout?: number;
+			fallbackDeadline?: number;
 			metadata?: string;
 		};
 
+		const maxBatchSize = options.maxBatchSize || 100;
 		const pollingInterval = (options.pollingInterval || 30) * 1000;
 		const timeout = (options.timeout || 1440) * 60 * 1000;
+		const fallbackDeadline = options.fallbackDeadline ? options.fallbackDeadline * 60 * 1000 : 0;
+
+		const credentials = await this.getCredentials('openAiApi');
 
 		// Build batch requests from input items
 		const batchRequests: BatchRequest[] = [];
@@ -482,35 +502,13 @@ export class OpenAiBatch implements INodeType {
 			batchRequests.push(request);
 		}
 
-		// Create JSONL content
-		const jsonlContent = batchRequests.map((req) => JSON.stringify(req)).join('\n');
+		// Split requests into chunks based on maxBatchSize
+		const chunks: BatchRequest[][] = [];
+		for (let i = 0; i < batchRequests.length; i += maxBatchSize) {
+			chunks.push(batchRequests.slice(i, i + maxBatchSize));
+		}
 
-		// Upload JSONL file to OpenAI
-		const uploadResponse = await this.helpers.httpRequestWithAuthentication.call(
-			this,
-			'openAiApi',
-			{
-				method: 'POST',
-				url: 'https://api.openai.com/v1/files',
-				headers: {
-					'Content-Type': 'multipart/form-data',
-				},
-				body: {
-					purpose: 'batch',
-					file: {
-						value: Buffer.from(jsonlContent, 'utf-8'),
-						options: {
-							filename: 'batch_requests.jsonl',
-							contentType: 'application/jsonl',
-						},
-					},
-				},
-			},
-		);
-
-		const inputFileId = uploadResponse.id;
-
-		// Create batch
+		// Parse metadata once
 		let metadata: Record<string, string> | undefined;
 		try {
 			if (options.metadata) {
@@ -520,106 +518,240 @@ export class OpenAiBatch implements INodeType {
 			throw new NodeOperationError(this.getNode(), 'Invalid metadata JSON');
 		}
 
-		const batchCreateBody: Record<string, unknown> = {
-			input_file_id: inputFileId,
-			endpoint: operation === 'chatCompletion' ? '/v1/chat/completions' : '/v1/embeddings',
-			completion_window: '24h',
-		};
-
-		if (metadata && Object.keys(metadata).length > 0) {
-			batchCreateBody.metadata = metadata;
+		// Track batches: batchId -> { customIds, status, outputFileId }
+		interface BatchInfo {
+			batchId: string;
+			customIds: string[];
+			status: BatchStatus['status'];
+			outputFileId: string | null;
 		}
+		const batches: BatchInfo[] = [];
 
-		const batchResponse = await this.helpers.httpRequestWithAuthentication.call(
-			this,
-			'openAiApi',
-			{
+		// Create batches for each chunk
+		for (let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex++) {
+			const chunk = chunks[chunkIndex];
+			const jsonlContent = chunk.map((req) => JSON.stringify(req)).join('\n');
+
+			// Upload JSONL file
+			const uploadResponse = await this.helpers.request({
 				method: 'POST',
-				url: 'https://api.openai.com/v1/batches',
+				url: 'https://api.openai.com/v1/files',
 				headers: {
-					'Content-Type': 'application/json',
+					Authorization: `Bearer ${credentials.apiKey}`,
 				},
-				body: batchCreateBody,
-			},
-		) as BatchStatus;
+				formData: {
+					purpose: 'batch',
+					file: {
+						value: Buffer.from(jsonlContent, 'utf-8'),
+						options: {
+							filename: `batch_requests_${chunkIndex}.jsonl`,
+							contentType: 'application/jsonl',
+						},
+					},
+				},
+				json: true,
+			});
 
-		const batchId = batchResponse.id;
+			const inputFileId = uploadResponse.id;
 
-		// Poll for batch completion
-		const startTime = Date.now();
-		let batchStatus: BatchStatus;
+			// Create batch
+			const batchCreateBody: Record<string, unknown> = {
+				input_file_id: inputFileId,
+				endpoint: operation === 'chatCompletion' ? '/v1/chat/completions' : '/v1/embeddings',
+				completion_window: '24h',
+			};
 
-		do {
-			await new Promise((resolve) => setTimeout(resolve, pollingInterval));
+			if (metadata && Object.keys(metadata).length > 0) {
+				batchCreateBody.metadata = { ...metadata, chunk: String(chunkIndex) };
+			}
 
-			batchStatus = await this.helpers.httpRequestWithAuthentication.call(
+			const batchResponse = await this.helpers.httpRequestWithAuthentication.call(
 				this,
 				'openAiApi',
 				{
-					method: 'GET',
-					url: `https://api.openai.com/v1/batches/${batchId}`,
+					method: 'POST',
+					url: 'https://api.openai.com/v1/batches',
+					headers: {
+						'Content-Type': 'application/json',
+					},
+					body: batchCreateBody,
 				},
 			) as BatchStatus;
 
-			if (Date.now() - startTime > timeout) {
+			batches.push({
+				batchId: batchResponse.id,
+				customIds: chunk.map((r) => r.custom_id),
+				status: batchResponse.status,
+				outputFileId: null,
+			});
+		}
+
+		// Poll for batch completion
+		const startTime = Date.now();
+		const resultMap = new Map<string, BatchResponse>();
+		const completedBatches = new Set<string>();
+		let deadlineReached = false;
+
+		while (completedBatches.size < batches.length) {
+			await new Promise((resolve) => setTimeout(resolve, pollingInterval));
+
+			const elapsed = Date.now() - startTime;
+
+			// Check hard timeout
+			if (elapsed > timeout) {
 				throw new NodeOperationError(
 					this.getNode(),
-					`Batch processing timed out after ${options.timeout || 1440} minutes. Batch ID: ${batchId}`,
+					`Batch processing timed out after ${options.timeout || 1440} minutes.`,
 				);
 			}
 
-			if (batchStatus.status === 'failed') {
-				const errorMessages = batchStatus.errors?.data?.map(e => e.message).join(', ') || 'Unknown error';
-				throw new NodeApiError(this.getNode(), {}, {
-					message: `Batch processing failed: ${errorMessages}`,
-					description: `Batch ID: ${batchId}`,
-				});
+			// Check fallback deadline
+			if (fallbackDeadline > 0 && elapsed > fallbackDeadline && !deadlineReached) {
+				deadlineReached = true;
+				break;
 			}
 
-			if (batchStatus.status === 'expired') {
-				throw new NodeOperationError(this.getNode(), `Batch expired. Batch ID: ${batchId}`);
+			// Poll each incomplete batch
+			for (const batch of batches) {
+				if (completedBatches.has(batch.batchId)) continue;
+
+				const batchStatus = await this.helpers.httpRequestWithAuthentication.call(
+					this,
+					'openAiApi',
+					{
+						method: 'GET',
+						url: `https://api.openai.com/v1/batches/${batch.batchId}`,
+					},
+				) as BatchStatus;
+
+				batch.status = batchStatus.status;
+				batch.outputFileId = batchStatus.output_file_id;
+
+				if (batchStatus.status === 'completed') {
+					completedBatches.add(batch.batchId);
+
+					// Download results for this batch
+					if (batchStatus.output_file_id) {
+						const outputFileResponse = await this.helpers.httpRequestWithAuthentication.call(
+							this,
+							'openAiApi',
+							{
+								method: 'GET',
+								url: `https://api.openai.com/v1/files/${batchStatus.output_file_id}/content`,
+								returnFullResponse: true,
+								json: false,
+							},
+						);
+
+						const outputContent = typeof outputFileResponse === 'string'
+							? outputFileResponse
+							: typeof outputFileResponse.body === 'string'
+								? outputFileResponse.body
+								: JSON.stringify(outputFileResponse.body);
+
+						const outputLines = outputContent.trim().split('\n');
+						const results: BatchResponse[] = outputLines.map((line: string) => JSON.parse(line));
+
+						for (const result of results) {
+							resultMap.set(result.custom_id, result);
+						}
+					}
+				} else if (batchStatus.status === 'failed') {
+					const errorMessages = batchStatus.errors?.data?.map(e => e.message).join(', ') || 'Unknown error';
+					throw new NodeApiError(this.getNode(), {}, {
+						message: `Batch processing failed: ${errorMessages}`,
+						description: `Batch ID: ${batch.batchId}`,
+					});
+				} else if (batchStatus.status === 'expired' || batchStatus.status === 'cancelled') {
+					completedBatches.add(batch.batchId);
+					// These requests will be handled as missing results or fallback
+				}
 			}
-
-			if (batchStatus.status === 'cancelled') {
-				throw new NodeOperationError(this.getNode(), `Batch was cancelled. Batch ID: ${batchId}`);
-			}
-
-		} while (batchStatus.status !== 'completed');
-
-		// Download results
-		if (!batchStatus.output_file_id) {
-			throw new NodeOperationError(this.getNode(), 'Batch completed but no output file was created');
 		}
 
-		const outputFileResponse = await this.helpers.httpRequestWithAuthentication.call(
-			this,
-			'openAiApi',
-			{
-				method: 'GET',
-				url: `https://api.openai.com/v1/files/${batchStatus.output_file_id}/content`,
-				returnFullResponse: true,
-				json: false,
-			},
-		);
+		// Handle fallback if deadline was reached
+		if (deadlineReached) {
+			// Cancel incomplete batches
+			for (const batch of batches) {
+				if (!completedBatches.has(batch.batchId) && !['completed', 'failed', 'expired', 'cancelled'].includes(batch.status)) {
+					try {
+						await this.helpers.httpRequestWithAuthentication.call(
+							this,
+							'openAiApi',
+							{
+								method: 'POST',
+								url: `https://api.openai.com/v1/batches/${batch.batchId}/cancel`,
+							},
+						);
+					} catch (e) {
+						// Ignore cancellation errors
+					}
+				}
+			}
 
-		const outputContent = typeof outputFileResponse === 'string'
-			? outputFileResponse
-			: typeof outputFileResponse.body === 'string'
-				? outputFileResponse.body
-				: JSON.stringify(outputFileResponse.body);
+			// Find requests that didn't complete
+			const incompleteCustomIds: string[] = [];
+			for (const batch of batches) {
+				for (const customId of batch.customIds) {
+					if (!resultMap.has(customId)) {
+						incompleteCustomIds.push(customId);
+					}
+				}
+			}
 
-		// Parse JSONL response
-		const outputLines = outputContent.trim().split('\n');
-		const results: BatchResponse[] = outputLines.map((line: string) => JSON.parse(line));
+			// Run incomplete requests in parallel
+			const syncPromises = incompleteCustomIds.map(async (customId) => {
+				const originalRequest = batchRequests.find((r) => r.custom_id === customId);
+				if (!originalRequest) return;
 
-		// Map results back to input items order
-		const resultMap = new Map<string, BatchResponse>();
-		for (const result of results) {
-			resultMap.set(result.custom_id, result);
+				try {
+					const syncResponse = await this.helpers.httpRequestWithAuthentication.call(
+						this,
+						'openAiApi',
+						{
+							method: 'POST',
+							url: `https://api.openai.com${originalRequest.url}`,
+							headers: {
+								'Content-Type': 'application/json',
+							},
+							body: originalRequest.body,
+						},
+					) as Record<string, unknown>;
+
+					// Convert sync response to batch response format
+					resultMap.set(customId, {
+						id: `sync-${customId}`,
+						custom_id: customId,
+						response: {
+							status_code: 200,
+							request_id: `sync-${customId}`,
+							body: syncResponse,
+						},
+						error: null,
+					});
+				} catch (error) {
+					resultMap.set(customId, {
+						id: `sync-${customId}`,
+						custom_id: customId,
+						response: {
+							status_code: 500,
+							request_id: `sync-${customId}`,
+							body: {},
+						},
+						error: {
+							code: 'sync_error',
+							message: error instanceof Error ? error.message : 'Unknown error during synchronous fallback',
+						},
+					});
+				}
+			});
+
+			await Promise.all(syncPromises);
 		}
 
 		// Create output items
 		const returnData: INodeExecutionData[] = [];
+		const batchIds = batches.map((b) => b.batchId).join(',');
 
 		for (let i = 0; i < items.length; i++) {
 			const customId = `request-${i}`;
@@ -631,8 +763,9 @@ export class OpenAiBatch implements INodeType {
 						json: {
 							...items[i].json,
 							error: result.error,
-							batchId,
+							batchId: batchIds,
 							customId,
+							fallback: result.id.startsWith('sync-'),
 						},
 						pairedItem: { item: i },
 					});
@@ -651,8 +784,9 @@ export class OpenAiBatch implements INodeType {
 								...items[i].json,
 								response: choices[0]?.message?.content || '',
 								fullResponse: responseBody,
-								batchId,
+								batchId: batchIds,
 								customId,
+								fallback: result.id.startsWith('sync-'),
 							},
 							pairedItem: { item: i },
 						});
@@ -667,8 +801,9 @@ export class OpenAiBatch implements INodeType {
 								...items[i].json,
 								embedding: data[0]?.embedding || [],
 								fullResponse: responseBody,
-								batchId,
+								batchId: batchIds,
 								customId,
+								fallback: result.id.startsWith('sync-'),
 							},
 							pairedItem: { item: i },
 						});
@@ -679,8 +814,9 @@ export class OpenAiBatch implements INodeType {
 					json: {
 						...items[i].json,
 						error: { message: 'No result found for this request' },
-						batchId,
+						batchId: batchIds,
 						customId,
+						fallback: false,
 					},
 					pairedItem: { item: i },
 				});

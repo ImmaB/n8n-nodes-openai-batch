@@ -141,7 +141,11 @@ async function sleep(ms: number): Promise<void> {
 }
 
 async function testBatch() {
-	console.log('🚀 Starting OpenAI Batch API test...\n');
+	console.log('🚀 Starting OpenAI Batch API test with 1-minute fallback deadline...\n');
+
+	// Configuration
+	const FALLBACK_DEADLINE_MS = 60 * 1000; // 1 minute
+	const POLL_INTERVAL_MS = 5000; // 5 seconds
 
 	// Create test requests
 	const testMessages = [
@@ -187,48 +191,123 @@ async function testBatch() {
 	console.log(`✅ Batch created: ${batchResponse.id}`);
 	console.log(`   Status: ${batchResponse.status}\n`);
 
-	// Poll for completion
-	console.log('⏳ Waiting for batch to complete...');
+	// Poll for completion with fallback deadline
+	console.log(`⏳ Waiting for batch to complete (fallback deadline: 1 minute)...`);
+	const startTime = Date.now();
 	let status = batchResponse.status;
 	let batchInfo: {
 		status: string;
 		output_file_id?: string;
 		request_counts?: { total: number; completed: number; failed: number };
 	};
+	let deadlineReached = false;
+
+	// Track results from batch
+	const resultMap = new Map<string, { content: string; fallback: boolean }>();
 
 	while (!['completed', 'failed', 'expired', 'cancelled'].includes(status)) {
-		await sleep(5000); // Check every 5 seconds for testing
+		const elapsed = Date.now() - startTime;
+
+		// Check if fallback deadline reached
+		if (elapsed >= FALLBACK_DEADLINE_MS) {
+			console.log(`\n⚠️  Fallback deadline reached after ${Math.round(elapsed / 1000)}s!`);
+			deadlineReached = true;
+			break;
+		}
+
+		await sleep(POLL_INTERVAL_MS);
 		batchInfo = (await makeRequest('GET', `/v1/batches/${batchResponse.id}`)) as typeof batchInfo;
 		status = batchInfo.status;
+		const elapsedSec = Math.round((Date.now() - startTime) / 1000);
 		console.log(
-			`   Status: ${status} (${batchInfo.request_counts?.completed || 0}/${batchInfo.request_counts?.total || 0} completed)`
+			`   Status: ${status} (${batchInfo.request_counts?.completed || 0}/${batchInfo.request_counts?.total || 0} completed) [${elapsedSec}s elapsed]`
 		);
 	}
 
-	if (status !== 'completed') {
+	if (deadlineReached) {
+		// Cancel the batch
+		console.log(`\n🛑 Cancelling batch ${batchResponse.id}...`);
+		try {
+			await makeRequest('POST', `/v1/batches/${batchResponse.id}/cancel`);
+			console.log('   Batch cancellation requested');
+		} catch (e) {
+			console.log('   Could not cancel batch (may already be done)');
+		}
+
+		// Check if any results completed before deadline
+		batchInfo = (await makeRequest('GET', `/v1/batches/${batchResponse.id}`)) as typeof batchInfo;
+		if (batchInfo.output_file_id) {
+			console.log('\n📥 Downloading partial results from batch...');
+			const partialResults = (await makeRequest(
+				'GET',
+				`/v1/files/${batchInfo.output_file_id}/content`
+			)) as string;
+
+			if (partialResults && typeof partialResults === 'string' && partialResults.trim()) {
+				const lines = partialResults.trim().split('\n');
+				for (const line of lines) {
+					const parsed = JSON.parse(line);
+					const content = parsed.response?.body?.choices?.[0]?.message?.content;
+					resultMap.set(parsed.custom_id, { content, fallback: false });
+				}
+				console.log(`   Got ${resultMap.size} results from batch`);
+			}
+		}
+
+		// Find incomplete requests
+		const incompleteRequests = batchRequests.filter(r => !resultMap.has(r.custom_id));
+		console.log(`\n🔄 Running ${incompleteRequests.length} incomplete requests in parallel...`);
+
+		const syncPromises = incompleteRequests.map(async (req) => {
+			try {
+				const syncResponse = (await makeRequest('POST', req.url, req.body)) as {
+					choices?: Array<{ message?: { content?: string } }>;
+				};
+				const content = syncResponse.choices?.[0]?.message?.content || '';
+				resultMap.set(req.custom_id, { content, fallback: true });
+				console.log(`   ✅ ${req.custom_id}: ${content}`);
+			} catch (e) {
+				console.log(`   ❌ ${req.custom_id}: Error - ${e instanceof Error ? e.message : 'Unknown error'}`);
+				resultMap.set(req.custom_id, { content: 'ERROR', fallback: true });
+			}
+		});
+
+		await Promise.all(syncPromises);
+	} else if (status === 'completed') {
+		console.log('\n✅ Batch completed before deadline!\n');
+
+		// Get results
+		batchInfo = (await makeRequest('GET', `/v1/batches/${batchResponse.id}`)) as typeof batchInfo;
+		if (!batchInfo.output_file_id) {
+			throw new Error('No output file ID');
+		}
+
+		console.log('📥 Downloading results...');
+		const results = (await makeRequest(
+			'GET',
+			`/v1/files/${batchInfo.output_file_id}/content`
+		)) as string;
+
+		const lines = results.trim().split('\n');
+		for (const line of lines) {
+			const parsed = JSON.parse(line);
+			const content = parsed.response?.body?.choices?.[0]?.message?.content;
+			resultMap.set(parsed.custom_id, { content, fallback: false });
+		}
+	} else {
 		throw new Error(`Batch ended with status: ${status}`);
 	}
 
-	console.log('\n✅ Batch completed!\n');
-
-	// Get results
-	batchInfo = (await makeRequest('GET', `/v1/batches/${batchResponse.id}`)) as typeof batchInfo;
-	if (!batchInfo.output_file_id) {
-		throw new Error('No output file ID');
-	}
-
-	console.log('📥 Downloading results...');
-	const results = (await makeRequest(
-		'GET',
-		`/v1/files/${batchInfo.output_file_id}/content`
-	)) as string;
-
-	console.log('\n📊 Results:');
-	const lines = results.trim().split('\n');
-	for (const line of lines) {
-		const parsed = JSON.parse(line);
-		const content = parsed.response?.body?.choices?.[0]?.message?.content;
-		console.log(`   ${parsed.custom_id}: ${content}`);
+	// Print final results
+	console.log('\n📊 Final Results:');
+	for (const req of batchRequests) {
+		const result = resultMap.get(req.custom_id);
+		if (result) {
+			const source = result.fallback ? '(sync fallback)' : '(batch)';
+			console.log(`   ${req.custom_id}: ${result.content} ${source}`);
+		} else {
+			console.log(`   ${req.custom_id}: No result`);
+		}
 	}
 
 	console.log('\n✅ Test completed successfully!');
