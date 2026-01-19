@@ -124,6 +124,62 @@ export class OpenAiBatch implements INodeType {
 				description: 'The model to use for chat completion',
 			},
 			{
+				displayName: 'Input Mode',
+				name: 'inputMode',
+				type: 'options',
+				displayOptions: {
+					show: {
+						operation: ['chatCompletion'],
+					},
+				},
+				options: [
+					{
+						name: 'Simple',
+						value: 'simple',
+						description: 'Just provide a prompt (user message)',
+					},
+					{
+						name: 'Advanced',
+						value: 'advanced',
+						description: 'Configure full message array with roles',
+					},
+				],
+				default: 'simple',
+				description: 'How to provide input messages',
+			},
+			{
+				displayName: 'Prompt',
+				name: 'prompt',
+				type: 'string',
+				typeOptions: {
+					rows: 4,
+				},
+				displayOptions: {
+					show: {
+						operation: ['chatCompletion'],
+						inputMode: ['simple'],
+					},
+				},
+				default: '',
+				description: 'The prompt to send. Use expressions like {{ $json.prompt }} to reference input data.',
+			},
+			{
+				displayName: 'System Prompt',
+				name: 'systemPrompt',
+				type: 'string',
+				typeOptions: {
+					rows: 2,
+				},
+				displayOptions: {
+					show: {
+						operation: ['chatCompletion'],
+						inputMode: ['simple'],
+					},
+				},
+				default: '',
+				description: 'Optional system prompt to set the behavior of the assistant',
+			},
+			{
 				displayName: 'Messages',
 				name: 'messages',
 				type: 'fixedCollection',
@@ -133,6 +189,7 @@ export class OpenAiBatch implements INodeType {
 				displayOptions: {
 					show: {
 						operation: ['chatCompletion'],
+						inputMode: ['advanced'],
 					},
 				},
 				default: {},
@@ -362,15 +419,30 @@ export class OpenAiBatch implements INodeType {
 
 			if (operation === 'chatCompletion') {
 				const model = this.getNodeParameter('model', i) as string;
-				const messagesParam = this.getNodeParameter('messages.messagesValues', i, []) as Array<{
-					role: string;
-					content: string;
-				}>;
+				const inputMode = this.getNodeParameter('inputMode', i, 'simple') as string;
 
-				const messages = messagesParam.map((msg) => ({
-					role: msg.role,
-					content: msg.content,
-				}));
+				let messages: Array<{ role: string; content: string }>;
+
+				if (inputMode === 'simple') {
+					const prompt = this.getNodeParameter('prompt', i) as string;
+					const systemPrompt = this.getNodeParameter('systemPrompt', i, '') as string;
+
+					messages = [];
+					if (systemPrompt) {
+						messages.push({ role: 'system', content: systemPrompt });
+					}
+					messages.push({ role: 'user', content: prompt });
+				} else {
+					const messagesParam = this.getNodeParameter('messages.messagesValues', i, []) as Array<{
+						role: string;
+						content: string;
+					}>;
+
+					messages = messagesParam.map((msg) => ({
+						role: msg.role,
+						content: msg.content,
+					}));
+				}
 
 				const body: Record<string, unknown> = {
 					model,
