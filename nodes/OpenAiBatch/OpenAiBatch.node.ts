@@ -1,6 +1,8 @@
 import {
 	IExecuteFunctions,
+	ILoadOptionsFunctions,
 	INodeExecutionData,
+	INodePropertyOptions,
 	INodeType,
 	INodeTypeDescription,
 	NodeApiError,
@@ -115,28 +117,9 @@ export class OpenAiBatch implements INodeType {
 						operation: ['chatCompletion'],
 					},
 				},
-				options: [
-					{
-						name: 'GPT-4o',
-						value: 'gpt-4o',
-					},
-					{
-						name: 'GPT-4o Mini',
-						value: 'gpt-4o-mini',
-					},
-					{
-						name: 'GPT-4 Turbo',
-						value: 'gpt-4-turbo',
-					},
-					{
-						name: 'GPT-4',
-						value: 'gpt-4',
-					},
-					{
-						name: 'GPT-3.5 Turbo',
-						value: 'gpt-3.5-turbo',
-					},
-				],
+				typeOptions: {
+					loadOptionsMethod: 'getChatModels',
+				},
 				default: 'gpt-4o-mini',
 				description: 'The model to use for chat completion',
 			},
@@ -204,20 +187,9 @@ export class OpenAiBatch implements INodeType {
 						operation: ['embeddings'],
 					},
 				},
-				options: [
-					{
-						name: 'text-embedding-3-small',
-						value: 'text-embedding-3-small',
-					},
-					{
-						name: 'text-embedding-3-large',
-						value: 'text-embedding-3-large',
-					},
-					{
-						name: 'text-embedding-ada-002',
-						value: 'text-embedding-ada-002',
-					},
-				],
+				typeOptions: {
+					loadOptionsMethod: 'getEmbeddingModels',
+				},
 				default: 'text-embedding-3-small',
 				description: 'The model to use for embeddings',
 			},
@@ -297,6 +269,75 @@ export class OpenAiBatch implements INodeType {
 				],
 			},
 		],
+	};
+
+	methods = {
+		loadOptions: {
+			async getChatModels(this: ILoadOptionsFunctions): Promise<INodePropertyOptions[]> {
+				try {
+					const response = await this.helpers.httpRequestWithAuthentication.call(
+						this,
+						'openAiApi',
+						{
+							method: 'GET',
+							url: 'https://api.openai.com/v1/models',
+						},
+					) as { data: Array<{ id: string; owned_by: string }> };
+
+					const chatModels = response.data
+						.filter((model) => {
+							const id = model.id.toLowerCase();
+							return (
+								id.includes('gpt') ||
+								id.includes('o1') ||
+								id.includes('o3') ||
+								id.includes('chatgpt')
+							) && !id.includes('instruct') && !id.includes('audio') && !id.includes('realtime');
+						})
+						.map((model) => ({
+							name: model.id,
+							value: model.id,
+						}))
+						.sort((a, b) => a.name.localeCompare(b.name));
+
+					return chatModels.length > 0 ? chatModels : [{ name: 'gpt-4o-mini', value: 'gpt-4o-mini' }];
+				} catch (error) {
+					return [
+						{ name: 'gpt-4o-mini', value: 'gpt-4o-mini' },
+						{ name: 'gpt-4o', value: 'gpt-4o' },
+						{ name: 'gpt-4-turbo', value: 'gpt-4-turbo' },
+					];
+				}
+			},
+
+			async getEmbeddingModels(this: ILoadOptionsFunctions): Promise<INodePropertyOptions[]> {
+				try {
+					const response = await this.helpers.httpRequestWithAuthentication.call(
+						this,
+						'openAiApi',
+						{
+							method: 'GET',
+							url: 'https://api.openai.com/v1/models',
+						},
+					) as { data: Array<{ id: string; owned_by: string }> };
+
+					const embeddingModels = response.data
+						.filter((model) => model.id.toLowerCase().includes('embedding'))
+						.map((model) => ({
+							name: model.id,
+							value: model.id,
+						}))
+						.sort((a, b) => a.name.localeCompare(b.name));
+
+					return embeddingModels.length > 0 ? embeddingModels : [{ name: 'text-embedding-3-small', value: 'text-embedding-3-small' }];
+				} catch (error) {
+					return [
+						{ name: 'text-embedding-3-small', value: 'text-embedding-3-small' },
+						{ name: 'text-embedding-3-large', value: 'text-embedding-3-large' },
+					];
+				}
+			},
+		},
 	};
 
 	async execute(this: IExecuteFunctions): Promise<INodeExecutionData[][]> {
