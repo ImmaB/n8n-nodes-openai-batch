@@ -812,7 +812,6 @@ export class OpenAiBatch implements INodeType {
 				if (result.error) {
 					returnData.push({
 						json: {
-							...items[i].json,
 							error: result.error,
 							batchId: batchIds,
 							customId,
@@ -825,8 +824,7 @@ export class OpenAiBatch implements INodeType {
 					if (!result.response || !result.response.body) {
 						returnData.push({
 							json: {
-								...items[i].json,
-								error: {
+									error: {
 									message: 'Invalid response structure: missing response or body',
 									rawResult: result,
 								},
@@ -851,8 +849,7 @@ export class OpenAiBatch implements INodeType {
 						if (!choices || !Array.isArray(choices) || choices.length === 0) {
 							returnData.push({
 								json: {
-									...items[i].json,
-									error: {
+											error: {
 										message: 'No choices in response',
 										statusCode: result.response.status_code,
 									},
@@ -866,8 +863,7 @@ export class OpenAiBatch implements INodeType {
 						} else {
 							returnData.push({
 								json: {
-									...items[i].json,
-									response: choices[0]?.message?.content || '',
+											response: choices[0]?.message?.content || '',
 									fullResponse: responseBody,
 									batchId: batchIds,
 									customId,
@@ -885,8 +881,7 @@ export class OpenAiBatch implements INodeType {
 						if (!data || !Array.isArray(data) || data.length === 0) {
 							returnData.push({
 								json: {
-									...items[i].json,
-									error: {
+											error: {
 										message: 'No embedding data in response',
 										statusCode: result.response.status_code,
 									},
@@ -900,8 +895,7 @@ export class OpenAiBatch implements INodeType {
 						} else {
 							returnData.push({
 								json: {
-									...items[i].json,
-									embedding: data[0]?.embedding || [],
+											embedding: data[0]?.embedding || [],
 									fullResponse: responseBody,
 									batchId: batchIds,
 									customId,
@@ -914,8 +908,7 @@ export class OpenAiBatch implements INodeType {
 						// Fallback for unknown operation (shouldn't happen)
 						returnData.push({
 							json: {
-								...items[i].json,
-								error: { message: `Unknown operation: ${operation}` },
+									error: { message: `Unknown operation: ${operation}` },
 								fullResponse: responseBody,
 								batchId: batchIds,
 								customId,
