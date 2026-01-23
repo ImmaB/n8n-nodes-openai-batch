@@ -433,35 +433,71 @@ export class OpenAiBatch implements INodeType {
 
 		// Build batch requests from input items
 		const batchRequests: BatchRequest[] = [];
+		const resultMap = new Map<string, BatchResponse>();
+		const skippedItems = new Set<number>();
 
 		for (let i = 0; i < items.length; i++) {
 			let request: BatchRequest;
+			const customId = `request-${i}`;
 
 			if (operation === 'chatCompletion') {
 				const model = this.getNodeParameter('model', i) as string;
 				const inputMode = this.getNodeParameter('inputMode', i, 'simple') as string;
 
 				let messages: Array<{ role: string; content: string }>;
+				let isEmpty = false;
 
 				if (inputMode === 'simple') {
 					const prompt = this.getNodeParameter('prompt', i) as string;
 					const systemPrompt = this.getNodeParameter('systemPrompt', i, '') as string;
 
+					// Check for empty prompt
+					if (!prompt || !prompt.trim()) {
+						isEmpty = true;
+					}
+
 					messages = [];
 					if (systemPrompt) {
 						messages.push({ role: 'system', content: systemPrompt });
 					}
-					messages.push({ role: 'user', content: prompt });
+					messages.push({ role: 'user', content: prompt || '' });
 				} else {
 					const messagesParam = this.getNodeParameter('messages.messagesValues', i, []) as Array<{
 						role: string;
 						content: string;
 					}>;
 
+					// Check for empty messages
+					if (!messagesParam || messagesParam.length === 0) {
+						isEmpty = true;
+					}
+
 					messages = messagesParam.map((msg) => ({
 						role: msg.role,
 						content: msg.content,
 					}));
+				}
+
+				// Skip empty prompts and store empty response
+				if (isEmpty) {
+					skippedItems.add(i);
+					resultMap.set(customId, {
+						id: `empty-${customId}`,
+						custom_id: customId,
+						response: {
+							status_code: 200,
+							request_id: `empty-${customId}`,
+							body: {
+								choices: [{
+									message: { content: '', role: 'assistant' },
+									index: 0,
+									finish_reason: 'skipped',
+								}],
+							},
+						},
+						error: null,
+					});
+					continue;
 				}
 
 				const body: Record<string, unknown> = {
@@ -477,7 +513,7 @@ export class OpenAiBatch implements INodeType {
 				}
 
 				request = {
-					custom_id: `request-${i}`,
+					custom_id: customId,
 					method: 'POST',
 					url: '/v1/chat/completions',
 					body,
@@ -486,8 +522,29 @@ export class OpenAiBatch implements INodeType {
 				const model = this.getNodeParameter('embeddingModel', i) as string;
 				const inputText = this.getNodeParameter('inputText', i) as string;
 
+				// Skip empty input and store empty response
+				if (!inputText || !inputText.trim()) {
+					skippedItems.add(i);
+					resultMap.set(customId, {
+						id: `empty-${customId}`,
+						custom_id: customId,
+						response: {
+							status_code: 200,
+							request_id: `empty-${customId}`,
+							body: {
+								data: [{
+									embedding: [],
+									index: 0,
+								}],
+							},
+						},
+						error: null,
+					});
+					continue;
+				}
+
 				request = {
-					custom_id: `request-${i}`,
+					custom_id: customId,
 					method: 'POST',
 					url: '/v1/embeddings',
 					body: {
@@ -588,7 +645,6 @@ export class OpenAiBatch implements INodeType {
 
 		// Poll for batch completion
 		const startTime = Date.now();
-		const resultMap = new Map<string, BatchResponse>();
 		const completedBatches = new Set<string>();
 		let deadlineReached = false;
 
